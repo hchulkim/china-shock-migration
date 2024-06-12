@@ -4,6 +4,9 @@ proc/
 literature/
 document/
 
+# macos file
+.DS_Store
+
 # R project files
 *.Rproj
 
