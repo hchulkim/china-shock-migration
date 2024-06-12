@@ -9,6 +9,12 @@
 # for 1:1 or n:1, just simply use left_join
 # for 1:n we need to do right_join (or just do left join but otherway around)
 
+# Our process of the concordance: 
+  
+  # hs96 to hs07.
+  # hs07 to cpc2 to cpc2.1 to ksic10
+  # hs17 to cpc2.1 to ksic10
+
 if (!require(pacman)) (install.packages("pacman"))
 pacman::p_load(concordance, tidyverse)
 
