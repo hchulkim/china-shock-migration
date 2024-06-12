@@ -1,8 +1,6 @@
-# Run script for example project
-
-# REPORDUCIBILITY -----------------------------------------------------
-# Use renv package to get the system-specific library environment 
-renv::restore()
+# Creator: Hyoungchul Kim
+# Revised date: 2024/07/12
+# Description: This is a run script for the whole project. 
 
 # PACKAGES -----------------------------------------------------------------
 library(here)
