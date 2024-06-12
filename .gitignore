@@ -1,3 +1,9 @@
+# data, literature, documentation folders
+data/
+proc/
+literature/
+document/
+
 # R project files
 *.Rproj
 
