@@ -78,7 +78,8 @@ cpc21_ksic10 <- readxl::read_xlsx("data/concordance/industry/att5_concordance2_f
   unique()
 
 
-
+# fill NA with above value
+cpc21_ksic10 <- cpc21_ksic10 %>% fill(ksic10)
 
 # filter out where cpc21:ksic = 1:n
 
