@@ -1,2143 +1,680 @@
-if (!require(pacman)) (install.packages("pacman"))
-pacman::p_load(here, gt, data.table, sf, tidyverse)
+##############################
+# creator: Hyoungchul Kim
+# revised date: 06/23/2024
+# description: This script uses crosswalk code to transition hs code level comtrade data into ksic10 industry level.
+##############################
+
+
+if (!require(pacman)) install.packages("pacman")
+pacman::p_load(fs, here, gcamdata, tidyverse)
+
+# read in the comtrade data
+comtrade_data <- dir_ls(path = here("data/comtrade"), glob = "*.csv") %>% 
+  map(read_csv) %>% 
+  list_rbind()
+
+# only select necessary columns
+comtrade_data <- comtrade_data %>%
+  select(year = RefYear, cntry = ReporterISO, flow_type = FlowDesc, hscode = CmdCode, hscode_type = ClassificationCode, fobvalue = Fobvalue, cifvalue = Cifvalue)
+
+# This checks if there are some inconsistencies with the trade value for each countries.
+if (FALSE) {
+ # list countries used in the data
+ country <- comtrade_data %>% 
+   select(cntry) %>%
+   distinct() %>% 
+   pull()
+ 
+ # check if import = cif value, export = fob value. also see if there is NA.
+ 
+ check <- map_df(country, function(cty) {
+   comtrade_data %>%
+     filter(cntry == cty) %>%
+     mutate(na_check = case_when(
+       flow_type == "Import" & is.na(cifvalue) ~ 1,
+       flow_type == "Export" & is.na(fobvalue) ~ 1,
+       TRUE ~ 0 
+     )) %>%
+     group_by(cntry, flow_type) %>%
+     summarise(na_check = sum(na_check), .groups = 'drop') %>%
+     pivot_wider(names_from = flow_type, values_from = na_check)
+ }) 
+
+ # result: the only problem is the import part in AUS in year 2001, 2010.
+ # solution: For 2001, 2010, use fobvalue for import.
+}
+
+# for 2001, 2010 in AUS import data, use fobvalue for import instead of cifvalue. this is due to reporting policy of AUS (probably)
+comtrade_data <- comtrade_data %>% 
+  mutate(cifvalue = if_else(cntry == "AUS" & year < 2019, fobvalue, cifvalue))
+
+# use gdp deflator package gcamdata to set all values into 2019.
+comtrade_data <- comtrade_data %>% 
+  mutate(cifvalue = case_when(
+    year == 2001 ~ cifvalue * gdp_deflator(2019, base_year = 2001),
+    year == 2010 ~ cifvalue * gdp_deflator(2019, base_year = 2010),
+    .default = cifvalue 
+  ), 
+  fobvalue = case_when(
+    year == 2001 ~ fobvalue * gdp_deflator(2019, base_year = 2001),
+    year == 2010 ~ fobvalue * gdp_deflator(2019, base_year = 2010),
+    .default = fobvalue 
+  ))
+
+# separate data into two parts by export and import
+import_data <- comtrade_data %>% 
+  filter(flow_type == "Import") %>% 
+  select(-c("flow_type", "fobvalue")) %>% 
+  rename(value = cifvalue)
+
+export_data <- comtrade_data %>% 
+  filter(flow_type == "Export") %>% 
+  select(-c("flow_type", "cifvalue")) %>% 
+  rename(value = fobvalue)
+
+# save the processed data into temp folder
+import_data %>% write_rds("data/temp/import_data.rds")
+export_data %>% write_rds("data/temp/export_data.rds")
+
+#-------------------- 
+# transform the hs code to cpc code.
+#-------------------- 
+
+# read in the crosswalk data
+hs96_hs07 <- read_rds(here("data", "concordance", "hs_cpc_ksic", "hs96_hs07.rds"))
+hs07_cpc2 <- read_rds(here("data", "concordance", "hs_cpc_ksic", "hs07_cpc2.rds"))
+cpc2_cpc21 <- read_rds(here("data", "concordance", "hs_cpc_ksic", "cpc2_cpc21.rds"))
+hs17_cpc21 <- read_rds(here("data", "concordance", "hs_cpc_ksic", "hs17_cpc21.rds"))
+cpc21_ksic10 <- read_rds(here("data", "concordance", "hs_cpc_ksic", "cpc21_ksic10.rds"))
+
+#-------------------- 
+# 1. 2001: hs96 to hs07 
+# import 2001 data conversion
+
+# 2001 data is in hs1, hs1996 version. we need to transition this into cpc2 code.
+import_data2001 <- import_data %>% 
+  filter(year == 2001)
+
+# divide the hs96 to hs07 to n:1 and 1:n case and process the transition.
+# n:1 case
+hs96_hs07_n1 <- hs96_hs07 %>% 
+  filter(weight >= 1)
 
+import_data2001 <- import_data2001 %>% 
+  left_join(hs96_hs07_n1, by=c("hscode"="HS_1996"))
 
+# leave out the one that has NA.
+import_data2001_1n <- import_data2001 %>% 
+  filter(is.na(HS_2007)) %>% 
+  select(-c("HS_2007", "weight"))
 
+import_data2001 <- import_data2001 %>% 
+  filter(!is.na(HS_2007)) %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(hscode = HS_2007) %>% 
+  mutate(hscode_type = "H3")
 
+# take care of the 1:n case
+hs96_hs07_1n <- hs96_hs07 %>% 
+  filter(weight < 1)
 
+import_data2001_1n <- import_data2001_1n %>% 
+  left_join(hs96_hs07_1n, by=c("hscode"="HS_1996"), relationship = "many-to-many")
+  
+import_data2001_1n <- import_data2001_1n %>% 
+  mutate(value = value * weight, hscode_type = "H3") %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(hscode = HS_2007)
 
-# we are transforming un comtrade data from hs to ksic. The process goes from hs to cpc to ksic.
+import_data2001 <- import_data2001 %>% 
+  bind_rows(import_data2001_1n) %>% 
+  group_by(year, cntry, hscode_type, hscode) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup()
+
+# drop the NA as these are products that cannot be crosswalked. These are 999999 code which means the product type is not defined from the start.
+import_data2001 <- import_data2001 %>% filter(!is.na(value))
 
-##### overall framework:
+import_data_crosswalk <- import_data %>% filter(year > 2001)
+
+import_data_crosswalk <- import_data_crosswalk %>% 
+  bind_rows(import_data2001)
+
+# export 2001 data conversion
+
+# 2001 data is in hs1, hs1996 version. we need to transition this into cpc2 code.
+export_data2001 <- export_data %>% 
+  filter(year == 2001)
 
-# for 1:1 or n:1, just simply use left_join
-# for 1:n we need to do right_join (or just do left join but otherway around)
+# divide the hs96 to hs07 to n:1 and 1:n case and process the transition.
+# n:1 case
+hs96_hs07_n1 <- hs96_hs07 %>% 
+  filter(weight >= 1)
 
-# we can check this using weight. if weight is smaller than 1, that that's the 1:n case
+export_data2001 <- export_data2001 %>% 
+  left_join(hs96_hs07_n1, by=c("hscode"="HS_1996"))
 
+# leave out the one that has NA.
+export_data2001_1n <- export_data2001 %>% 
+  filter(is.na(HS_2007)) %>% 
+  select(-c("HS_2007", "weight"))
 
+export_data2001 <- export_data2001 %>% 
+  filter(!is.na(HS_2007)) %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(hscode = HS_2007) %>% 
+  mutate(hscode_type = "H3")
 
-# read in all the conversion tables -------
+# take care of the 1:n case
+hs96_hs07_1n <- hs96_hs07 %>% 
+  filter(weight < 1)
 
+export_data2001_1n <- export_data2001_1n %>% 
+  left_join(hs96_hs07_1n, by=c("hscode"="HS_1996"), relationship = "many-to-many")
+  
+export_data2001_1n <- export_data2001_1n %>% 
+  mutate(value = value * weight, hscode_type = "H3") %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(hscode = HS_2007)
 
+export_data2001 <- export_data2001 %>% 
+  bind_rows(export_data2001_1n) %>% 
+  group_by(year, cntry, hscode_type, hscode) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup()
 
+# drop the NA as these are products that cannot be crosswalked. These are 999999 code which means the product type is not defined from the start.
+export_data2001 <- export_data2001 %>% filter(!is.na(value))
 
 
-hs96_hs07 <- read_rds(here("data", "final", "hs_cpc_ksic","hs96_hs07.rds"))
+export_data_crosswalk <- export_data %>% filter(year > 2001)
 
-hs07_cpc2  <- read_rds(here("data", "final", "hs_cpc_ksic","hs07_cpc2.rds"))
-hs17_cpc21  <- read_rds(here("data", "final", "hs_cpc_ksic","hs17_cpc21.rds"))
+export_data_crosswalk <- export_data_crosswalk %>% 
+  bind_rows(export_data2001)
 
-cpc2_cpc21  <- read_rds(here("data", "final", "hs_cpc_ksic","cpc2_cpc21.rds"))
 
-cpc21_ksic10  <- read_rds(here("data", "final", "hs_cpc_ksic","cpc21_ksic10.rds"))
 
+#-------------------- 
+# 2. 2001 and 2010: hs07 to cpc2 
+# import data conversion
 
-ksic8_ksic9  <- read_rds(here("data", "final", "hs_cpc_ksic","ksic8_ksic9.rds"))
-ksic9_ksic10  <- read_rds(here("data", "final", "hs_cpc_ksic","ksic9_ksic10.rds"))
+# 2001, 2010 data is in hs3, hs2007 version. we need to transition this into cpc2 code.
+import_data_hs07 <- import_data_crosswalk %>% 
+  filter(year < 2011)
 
+# divide the hs07 to cpc2 to n:1 and 1:n case and process the transition.
+# n:1 case
+hs07_cpc2_n1 <- hs07_cpc2 %>% 
+  filter(weight >= 1)
 
-# read in all the data ------
+import_data_hs07 <- import_data_hs07 %>% 
+  left_join(hs07_cpc2_n1, by=c("hscode"="HS07Code"))
 
-chn_from_world_import2001 <- read_csv("data/comtrade/CHN_from_WORLD_IMPORT_2001_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
+# leave out the one that has NA.
+import_data_hs07_1n <- import_data_hs07 %>% 
+  filter(is.na(CPC2Code)) %>% 
+  select(-c("CPC2Code", "weight"))
 
-chn_from_world_import2010 <- read_csv("data/comtrade/CHN_from_WORLD_IMPORT_2010_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
+import_data_hs07 <- import_data_hs07 %>% 
+  filter(!is.na(CPC2Code)) %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(cpccode = CPC2Code) %>% 
+  mutate(hscode_type = "cpc2")
 
-chn_from_world_import2019 <- read_csv("data/comtrade/CHN_from_WORLD_IMPORT_2019_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
+# take care of the 1:n case
+hs07_cpc2_1n <- hs07_cpc2 %>% 
+  filter(weight < 1)
 
+import_data_hs07_1n <- import_data_hs07_1n %>% 
+  left_join(hs07_cpc2_1n, by=c("hscode"="HS07Code"), relationship = "many-to-many")
 
+import_data_hs07_1n <- import_data_hs07_1n %>% 
+  mutate(value = value * weight, hscode_type = "cpc2") %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(cpccode = CPC2Code)
 
-chn_to_world_export2001 <- read_csv("data/comtrade/CHN_to_WORLD_EXPORT_2001_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
+import_data_hs07 <- import_data_hs07 %>% 
+  bind_rows(import_data_hs07_1n) %>% 
+  group_by(year, cntry, hscode_type, cpccode) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup()
 
-chn_to_world_export2010 <- read_csv("data/comtrade/CHN_to_WORLD_EXPORT_2010_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
+# drop the NA as these are products that cannot be crosswalked. 
+import_data_hs07 <- import_data_hs07 %>% filter(!is.na(value))
 
-chn_to_world_export2019 <- read_csv("data/comtrade/CHN_to_WORLD_EXPORT_2019_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
+import_data_crosswalk <- import_data_crosswalk %>% filter(year > 2010)
 
+import_data_crosswalk <- import_data_crosswalk %>% 
+  bind_rows(import_data_hs07)
 
 
-jpn_from_chn_import2001 <- read_csv("data/comtrade/JPN_from_CHN_IMPORT_2001_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
-jpn_from_chn_import2010 <- read_csv("data/comtrade/JPN_from_CHN_IMPORT_2010_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
-jpn_from_chn_import2019 <- read_csv("data/comtrade/JPN_from_CHN_IMPORT_2019_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
 
 
+# export data conversion
 
-jpn_to_chn_export2001 <- read_csv("data/comtrade/JPN_to_CHN_EXPORT_2001_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
-jpn_to_chn_export2010 <- read_csv("data/comtrade/JPN_to_CHN_EXPORT_2010_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
-jpn_to_chn_export2019 <- read_csv("data/comtrade/JPN_to_CHN_EXPORT_2019_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
+# 2001, 2010 data is in hs3, hs2007 version. we need to transition this into cpc2 code.
+export_data_hs07 <- export_data_crosswalk %>% 
+  filter(year < 2011)
 
+# divide the hs07 to cpc2 to n:1 and 1:n case and process the transition.
+# n:1 case
+hs07_cpc2_n1 <- hs07_cpc2 %>% 
+  filter(weight >= 1)
 
+export_data_hs07 <- export_data_hs07 %>% 
+  left_join(hs07_cpc2_n1, by=c("hscode"="HS07Code"))
 
-kor_from_chn_import2001 <- read_csv("data/comtrade/KOR_from_CHN_IMPORT_2001_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
-kor_from_chn_import2010 <- read_csv("data/comtrade/KOR_from_CHN_IMPORT_2010_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
-kor_from_chn_import2019 <- read_csv("data/comtrade/KOR_from_CHN_IMPORT_2019_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
+# leave out the one that has NA.
+export_data_hs07_1n <- export_data_hs07 %>% 
+  filter(is.na(CPC2Code)) %>% 
+  select(-c("CPC2Code", "weight"))
 
+export_data_hs07 <- export_data_hs07 %>% 
+  filter(!is.na(CPC2Code)) %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(cpccode = CPC2Code) %>% 
+  mutate(hscode_type = "cpc2")
 
+# take care of the 1:n case
+hs07_cpc2_1n <- hs07_cpc2 %>% 
+  filter(weight < 1)
 
-kor_to_chn_export2001 <- read_csv("data/comtrade/KOR_to_CHN_EXPORT_2001_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
-kor_to_chn_export2010 <- read_csv("data/comtrade/KOR_to_CHN_EXPORT_2010_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
-kor_to_chn_export2019 <- read_csv("data/comtrade/KOR_to_CHN_EXPORT_2019_HS6.csv") %>% mutate(CmdCode=as.character(CmdCode)) %>% mutate(CmdCode=ifelse(str_length(CmdCode)==5, paste0("0", CmdCode), CmdCode))
+export_data_hs07_1n <- export_data_hs07_1n %>% 
+  left_join(hs07_cpc2_1n, by=c("hscode"="HS07Code"), relationship = "many-to-many")
 
+export_data_hs07_1n <- export_data_hs07_1n %>% 
+  mutate(value = value * weight, hscode_type = "cpc2") %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(cpccode = CPC2Code)
 
+export_data_hs07 <- export_data_hs07 %>% 
+  bind_rows(export_data_hs07_1n) %>% 
+  group_by(year, cntry, hscode_type, cpccode) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup()
 
+# drop the NA as these are products that cannot be crosswalked. 
+export_data_hs07 <- export_data_hs07 %>% filter(!is.na(value))
 
+export_data_crosswalk <- export_data_crosswalk %>% filter(year > 2010)
 
+export_data_crosswalk <- export_data_crosswalk %>% 
+  bind_rows(export_data_hs07)
 
-# hs96 to hs07 for year 2001
 
 
-chn_from_world_import2001 <- chn_from_world_import2001 %>% group_by(CmdCode) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
+#-------------------- 
+# 3. 2001 and 2010: cpc2 to cpc21 
+# import data conversion
 
-hs96_hs07_1 <- hs96_hs07 %>% filter(weight==1)
-hs96_hs07_2 <- hs96_hs07 %>% filter(weight!=1)
+# 2001, 2010 data is in cpc2 version. we need to transition this into cpc21 code.
+import_data_cpc2 <- import_data_crosswalk %>% 
+  filter(year < 2011) %>% 
+  select(-hscode)
 
-check <- hs96_hs07_2 %>% distinct(HS_1996) %>% pull(HS_1996)
+# divide the cpc2 to cpc21 to n:1 and 1:n case and process the transition.
+# n:1 case
+cpc2_cpc21_n1 <- cpc2_cpc21 %>% 
+  filter(weight >= 1)
 
+import_data_cpc2 <- import_data_cpc2 %>% 
+  left_join(cpc2_cpc21_n1, by=c("cpccode"="CPC2code"))
 
-chn_from_world_import2001_1 <- chn_from_world_import2001 %>% filter(!(CmdCode %in% check))  
+# leave out the one that has NA.
+import_data_cpc2_1n <- import_data_cpc2 %>% 
+  filter(is.na(CPC21code)) %>% 
+  select(-c("CPC21code", "weight"))
 
-chn_from_world_import2001_2 <- chn_from_world_import2001 %>% filter(CmdCode %in% check)  
+import_data_cpc2 <- import_data_cpc2 %>% 
+  filter(!is.na(CPC21code)) %>% 
+  select(-c("cpccode", "weight")) %>% 
+  rename(cpccode = CPC21code) %>% 
+  mutate(hscode_type = "cpc21")
 
-chn_from_world_import2001_1 <- chn_from_world_import2001_1 %>% 
-  left_join(hs96_hs07_1, by=c("CmdCode"="HS_1996")) %>% select(-CmdCode)
+# take care of the 1:n case
+cpc2_cpc21_1n <- cpc2_cpc21 %>% 
+  filter(weight < 1)
 
-hs96_hs07_2 <- hs96_hs07_2 %>% 
-  left_join(chn_from_world_import2001_2, by=c("HS_1996"="CmdCode")) %>% select(-HS_1996) 
+import_data_cpc2_1n <- import_data_cpc2_1n %>% 
+  left_join(cpc2_cpc21_1n, by=c("cpccode"="CPC2code"), relationship = "many-to-many")
 
+import_data_cpc2_1n <- import_data_cpc2_1n %>% 
+  mutate(value = value * weight, hscode_type = "cpc21") %>% 
+  select(-c("cpccode", "weight")) %>% 
+  rename(cpccode = CPC21code)
 
-chn_from_world_import2001 <- chn_from_world_import2001_1 %>% 
-  bind_rows(hs96_hs07_2) %>% filter(!is.na(Cifvalue))
+import_data_cpc2 <- import_data_cpc2 %>% 
+  bind_rows(import_data_cpc2_1n) %>% 
+  group_by(year, cntry, hscode_type, cpccode) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup()
 
+# drop the NA as these are products that cannot be crosswalked.
+import_data_cpc2 <- import_data_cpc2 %>% filter(!is.na(value))
 
-chn_from_world_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2001_hs07.dta"))
+import_data_crosswalk <- import_data_crosswalk %>% filter(year > 2010)
 
+import_data_crosswalk <- import_data_crosswalk %>% 
+  bind_rows(import_data_cpc2)
 
 
+# export data conversion
 
+# 2001, 2010 data is in cpc2 version. we need to transition this into cpc21 code.
+export_data_cpc2 <- export_data_crosswalk %>% 
+  filter(year < 2011) %>% 
+  select(-hscode)
 
+# divide the cpc2 to cpc21 to n:1 and 1:n case and process the transition.
+# n:1 case
+cpc2_cpc21_n1 <- cpc2_cpc21 %>% 
+  filter(weight >= 1)
 
+export_data_cpc2 <- export_data_cpc2 %>% 
+  left_join(cpc2_cpc21_n1, by=c("cpccode"="CPC2code"))
 
+# leave out the one that has NA.
+export_data_cpc2_1n <- export_data_cpc2 %>% 
+  filter(is.na(CPC21code)) %>% 
+  select(-c("CPC21code", "weight"))
 
+export_data_cpc2 <- export_data_cpc2 %>% 
+  filter(!is.na(CPC21code)) %>% 
+  select(-c("cpccode", "weight")) %>% 
+  rename(cpccode = CPC21code) %>% 
+  mutate(hscode_type = "cpc21")
 
+# take care of the 1:n case
+cpc2_cpc21_1n <- cpc2_cpc21 %>% 
+  filter(weight < 1)
 
-jpn_from_chn_import2001 <- jpn_from_chn_import2001 %>% group_by(CmdCode) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
+export_data_cpc2_1n <- export_data_cpc2_1n %>% 
+  left_join(cpc2_cpc21_1n, by=c("cpccode"="CPC2code"), relationship = "many-to-many")
 
-hs96_hs07_1 <- hs96_hs07 %>% filter(weight==1)
-hs96_hs07_2 <- hs96_hs07 %>% filter(weight!=1)
+export_data_cpc2_1n <- export_data_cpc2_1n %>% 
+  mutate(value = value * weight, hscode_type = "cpc21") %>% 
+  select(-c("cpccode", "weight")) %>% 
+  rename(cpccode = CPC21code)
 
-check <- hs96_hs07_2 %>% distinct(HS_1996) %>% pull(HS_1996)
+export_data_cpc2 <- export_data_cpc2 %>% 
+  bind_rows(export_data_cpc2_1n) %>% 
+  group_by(year, cntry, hscode_type, cpccode) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup()
 
+# drop the NA as these are products that cannot be crosswalked.
+export_data_cpc2 <- export_data_cpc2 %>% filter(!is.na(value))
 
-jpn_from_chn_import2001_1 <- jpn_from_chn_import2001 %>% filter(!(CmdCode %in% check))  
+export_data_crosswalk <- export_data_crosswalk %>% filter(year > 2010)
 
-jpn_from_chn_import2001_2 <- jpn_from_chn_import2001 %>% filter(CmdCode %in% check)  
+export_data_crosswalk <- export_data_crosswalk %>% 
+  bind_rows(export_data_cpc2)
 
-jpn_from_chn_import2001_1 <- jpn_from_chn_import2001_1 %>% 
-  left_join(hs96_hs07_1, by=c("CmdCode"="HS_1996")) %>% select(-CmdCode)
 
-hs96_hs07_2 <- hs96_hs07_2 %>% 
-  left_join(jpn_from_chn_import2001_2, by=c("HS_1996"="CmdCode")) %>% select(-HS_1996) 
 
 
-jpn_from_chn_import2001 <- jpn_from_chn_import2001_1 %>% 
-  bind_rows(hs96_hs07_2) %>%  filter(!is.na(Cifvalue))
+#-------------------- 
+# 4. 2019 and 2020: hs17 to cpc21 
+# import data conversion
 
-jpn_from_chn_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2001_hs07.dta"))
+# 2019, 2020 data is in hs17 version. we need to transition this into cpc21 code.
+import_data_hs17 <- import_data_crosswalk %>% 
+  filter(year > 2010) %>% 
+  select(-cpccode)
 
+# divide the hs17 to cpc21 to n:1 and 1:n case and process the transition.
+# n:1 case
+hs17_cpc21_n1 <- hs17_cpc21 %>% 
+  filter(weight >= 1)
 
+import_data_hs17 <- import_data_hs17 %>% 
+  left_join(hs17_cpc21_n1, by=c("hscode"="HS2017"))
 
+# leave out the one that has NA.
+import_data_hs17_1n <- import_data_hs17 %>% 
+  filter(is.na(CPC21)) %>% 
+  select(-c("CPC21", "weight"))
 
+import_data_hs17 <- import_data_hs17 %>% 
+  filter(!is.na(CPC21)) %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(cpccode = CPC21) %>% 
+  mutate(hscode_type = "cpc21")
 
+# take care of the 1:n case
+hs17_cpc21_1n <- hs17_cpc21 %>% 
+  filter(weight < 1)
 
-kor_from_chn_import2001 <- kor_from_chn_import2001 %>% group_by(CmdCode) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
+import_data_hs17_1n <- import_data_hs17_1n %>% 
+  left_join(hs17_cpc21_1n, by=c("hscode"="HS2017"), relationship = "many-to-many")
 
-hs96_hs07_1 <- hs96_hs07 %>% filter(weight==1)
-hs96_hs07_2 <- hs96_hs07 %>% filter(weight!=1)
+import_data_hs17_1n <- import_data_hs17_1n %>% 
+  mutate(value = value * weight, hscode_type = "cpc21") %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(cpccode = CPC21)
 
-check <- hs96_hs07_2 %>% distinct(HS_1996) %>% pull(HS_1996)
+import_data_hs17 <- import_data_hs17 %>% 
+  bind_rows(import_data_hs17_1n) %>% 
+  group_by(year, cntry, hscode_type, cpccode) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup()
 
+# drop the NA as these are products that cannot be crosswalked. case of 999999 code.
+import_data_hs17 <- import_data_hs17 %>% filter(!is.na(value))
 
-kor_from_chn_import2001_1 <-kor_from_chn_import2001  %>% filter(!(CmdCode %in% check))  
+import_data_crosswalk <- import_data_crosswalk %>% filter(year < 2011) %>% 
+  select(-hscode)
 
-kor_from_chn_import2001_2 <- kor_from_chn_import2001 %>% filter(CmdCode %in% check)  
+import_data_crosswalk <- import_data_crosswalk %>% 
+  bind_rows(import_data_hs17)
 
-kor_from_chn_import2001_1 <- kor_from_chn_import2001_1 %>% 
-  left_join(hs96_hs07_1, by=c("CmdCode"="HS_1996")) %>% select(-CmdCode)
 
-hs96_hs07_2 <- hs96_hs07_2 %>% 
-  left_join(kor_from_chn_import2001_2, by=c("HS_1996"="CmdCode")) %>% select(-HS_1996) 
 
 
-kor_from_chn_import2001 <- kor_from_chn_import2001_1 %>% 
-  bind_rows(hs96_hs07_2) %>%  filter(!is.na(Cifvalue))
+# export data conversion
 
-kor_from_chn_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2001_hs07.dta"))
+# 2019, 2020 data is in hs17 version. we need to transition this into cpc21 code.
+export_data_hs17 <- export_data_crosswalk %>% 
+  filter(year > 2010) %>% 
+  select(-cpccode)
 
+# divide the hs17 to cpc21 to n:1 and 1:n case and process the transition.
+# n:1 case
+hs17_cpc21_n1 <- hs17_cpc21 %>% 
+  filter(weight >= 1)
 
+export_data_hs17 <- export_data_hs17 %>% 
+  left_join(hs17_cpc21_n1, by=c("hscode"="HS2017"))
 
+# leave out the one that has NA.
+export_data_hs17_1n <- export_data_hs17 %>% 
+  filter(is.na(CPC21)) %>% 
+  select(-c("CPC21", "weight"))
 
+export_data_hs17 <- export_data_hs17 %>% 
+  filter(!is.na(CPC21)) %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(cpccode = CPC21) %>% 
+  mutate(hscode_type = "cpc21")
 
+# take care of the 1:n case
+hs17_cpc21_1n <- hs17_cpc21 %>% 
+  filter(weight < 1)
 
+export_data_hs17_1n <- export_data_hs17_1n %>% 
+  left_join(hs17_cpc21_1n, by=c("hscode"="HS2017"), relationship = "many-to-many")
 
+export_data_hs17_1n <- export_data_hs17_1n %>% 
+  mutate(value = value * weight, hscode_type = "cpc21") %>% 
+  select(-c("hscode", "weight")) %>% 
+  rename(cpccode = CPC21)
 
+export_data_hs17 <- export_data_hs17 %>% 
+  bind_rows(export_data_hs17_1n) %>% 
+  group_by(year, cntry, hscode_type, cpccode) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup()
 
+# drop the NA as these are products that cannot be crosswalked. case of 999999 code.
+export_data_hs17 <- export_data_hs17 %>% filter(!is.na(value))
 
+export_data_crosswalk <- export_data_crosswalk %>% filter(year < 2011) %>% 
+  select(-hscode)
 
-chn_to_world_export2001 <-chn_to_world_export2001  %>% group_by(CmdCode) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
+export_data_crosswalk <- export_data_crosswalk %>% 
+  bind_rows(export_data_hs17)
 
-hs96_hs07_1 <- hs96_hs07 %>% filter(weight==1)
-hs96_hs07_2 <- hs96_hs07 %>% filter(weight!=1)
 
-check <- hs96_hs07_2 %>% distinct(HS_1996) %>% pull(HS_1996)
 
 
-chn_to_world_export2001_1 <- chn_to_world_export2001 %>% filter(!(CmdCode %in% check))  
 
-chn_to_world_export2001_2 <-chn_to_world_export2001  %>% filter(CmdCode %in% check)  
+#-------------------- 
+# 5. all data: cpc21 to ksic10 
+# import data conversion
 
-chn_to_world_export2001_1 <- chn_to_world_export2001_1 %>% 
-  left_join(hs96_hs07_1, by=c("CmdCode"="HS_1996")) %>% select(-CmdCode)
+import_data_cpc21 <- import_data_crosswalk  
 
-hs96_hs07_2 <- hs96_hs07_2 %>% 
-  left_join(chn_to_world_export2001_2, by=c("HS_1996"="CmdCode")) %>% select(-HS_1996) 
+# divide the cpc21 to ksic10 to n:1 and 1:n case and process the transition.
+# n:1 case
+cpc21_ksic10_n1 <- cpc21_ksic10 %>% 
+  filter(weight >= 1)
 
+import_data_cpc21 <- import_data_cpc21 %>% 
+  left_join(cpc21_ksic10_n1, by=c("cpccode"="cpc21"))
 
-chn_to_world_export2001 <- chn_to_world_export2001_1 %>% 
-  bind_rows(hs96_hs07_2) %>%  filter(!is.na(Fobvalue))
+# leave out the one that has NA.
+import_data_cpc21_1n <- import_data_cpc21 %>% 
+  filter(is.na(ksic10)) %>% 
+  select(-c("ksic10", "weight"))
 
-chn_to_world_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2001_hs07.dta"))
+import_data_cpc21 <- import_data_cpc21 %>% 
+  filter(!is.na(ksic10)) %>% 
+  select(-c("cpccode", "weight")) %>% 
+  rename(ksiccode = ksic10) %>% 
+  mutate(hscode_type = "ksic10")
 
+# take care of the 1:n case
+cpc21_ksic10_1n <- cpc21_ksic10 %>% 
+  filter(weight < 1)
 
+import_data_cpc21_1n <- import_data_cpc21_1n %>% 
+  left_join(cpc21_ksic10_1n, by=c("cpccode"="cpc21"), relationship = "many-to-many")
 
+import_data_cpc21_1n <- import_data_cpc21_1n %>% 
+  mutate(value = value * weight, hscode_type = "ksic10") %>% 
+  select(-c("cpccode", "weight")) %>% 
+  rename(ksiccode = ksic10)
 
-jpn_to_chn_export2001 <-jpn_to_chn_export2001  %>% group_by(CmdCode) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
+import_data_cpc21 <- import_data_cpc21 %>% 
+  bind_rows(import_data_cpc21_1n) %>% 
+  group_by(year, cntry, hscode_type, ksiccode) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup()
 
-hs96_hs07_1 <- hs96_hs07 %>% filter(weight==1)
-hs96_hs07_2 <- hs96_hs07 %>% filter(weight!=1)
+# drop the NA as these are products that cannot be crosswalked.
+import_data_cpc21 <- import_data_cpc21 %>% filter(!is.na(value))
 
-check <- hs96_hs07_2 %>% distinct(HS_1996) %>% pull(HS_1996)
+import_data_crosswalk <- import_data_cpc21 
 
+import_data_crosswalk <- import_data_crosswalk %>% rename(code_type = hscode_type)
 
-jpn_to_chn_export2001_1 <- jpn_to_chn_export2001 %>% filter(!(CmdCode %in% check))  
 
-jpn_to_chn_export2001_2 <-jpn_to_chn_export2001  %>% filter(CmdCode %in% check)  
+# export data conversion
 
-jpn_to_chn_export2001_1 <- jpn_to_chn_export2001_1 %>% 
-  left_join(hs96_hs07_1, by=c("CmdCode"="HS_1996")) %>% select(-CmdCode)
+export_data_cpc21 <- export_data_crosswalk  
 
-hs96_hs07_2 <- hs96_hs07_2 %>% 
-  left_join(jpn_to_chn_export2001_2, by=c("HS_1996"="CmdCode")) %>% select(-HS_1996) 
+# divide the cpc21 to ksic10 to n:1 and 1:n case and process the transition.
+# n:1 case
+cpc21_ksic10_n1 <- cpc21_ksic10 %>% 
+  filter(weight >= 1)
 
+export_data_cpc21 <- export_data_cpc21 %>% 
+  left_join(cpc21_ksic10_n1, by=c("cpccode"="cpc21"))
 
-jpn_to_chn_export2001 <- jpn_to_chn_export2001_1 %>% 
-  bind_rows(hs96_hs07_2) %>%  filter(!is.na(Fobvalue))
+# leave out the one that has NA.
+export_data_cpc21_1n <- export_data_cpc21 %>% 
+  filter(is.na(ksic10)) %>% 
+  select(-c("ksic10", "weight"))
 
-jpn_to_chn_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2001_hs07.dta"))
+export_data_cpc21 <- export_data_cpc21 %>% 
+  filter(!is.na(ksic10)) %>% 
+  select(-c("cpccode", "weight")) %>% 
+  rename(ksiccode = ksic10) %>% 
+  mutate(hscode_type = "ksic10")
 
+# take care of the 1:n case
+cpc21_ksic10_1n <- cpc21_ksic10 %>% 
+  filter(weight < 1)
 
+export_data_cpc21_1n <- export_data_cpc21_1n %>% 
+  left_join(cpc21_ksic10_1n, by=c("cpccode"="cpc21"), relationship = "many-to-many")
 
-kor_to_chn_export2001 <-kor_to_chn_export2001  %>% group_by(CmdCode) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
+export_data_cpc21_1n <- export_data_cpc21_1n %>% 
+  mutate(value = value * weight, hscode_type = "ksic10") %>% 
+  select(-c("cpccode", "weight")) %>% 
+  rename(ksiccode = ksic10)
 
-hs96_hs07_1 <- hs96_hs07 %>% filter(weight==1)
-hs96_hs07_2 <- hs96_hs07 %>% filter(weight!=1)
+export_data_cpc21 <- export_data_cpc21 %>% 
+  bind_rows(export_data_cpc21_1n) %>% 
+  group_by(year, cntry, hscode_type, ksiccode) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup()
 
-check <- hs96_hs07_2 %>% distinct(HS_1996) %>% pull(HS_1996)
+# drop the NA as these are products that cannot be crosswalked. 
+export_data_cpc21 <- export_data_cpc21 %>% filter(!is.na(value))
 
+export_data_crosswalk <- export_data_cpc21 
 
-kor_to_chn_export2001_1 <- kor_to_chn_export2001 %>% filter(!(CmdCode %in% check))  
+export_data_crosswalk <- export_data_crosswalk %>% rename(code_type = hscode_type)
 
-kor_to_chn_export2001_2 <-kor_to_chn_export2001  %>% filter(CmdCode %in% check)  
 
-kor_to_chn_export2001_1 <- kor_to_chn_export2001_1 %>% 
-  left_join(hs96_hs07_1, by=c("CmdCode"="HS_1996")) %>% select(-CmdCode)
 
-hs96_hs07_2 <- hs96_hs07_2 %>% 
-  left_join(kor_to_chn_export2001_2, by=c("HS_1996"="CmdCode")) %>% select(-HS_1996) 
+#-------------------- 
+# Compare the aggregate value between origin and transformed data
+#-------------------- 
 
+import <- import_data %>% 
+  group_by(year, cntry) %>% 
+  summarise(old_value = sum(value)) %>% 
+  ungroup()
 
-kor_to_chn_export2001 <- kor_to_chn_export2001_1 %>% 
-  bind_rows(hs96_hs07_2) %>%  filter(!is.na(Fobvalue))
+import_new <- import_data_crosswalk %>% 
+  group_by(year, cntry) %>% 
+  summarise(new_value = sum(value)) %>% 
+  ungroup()
 
-kor_to_chn_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2001_hs07.dta"))
+import <- import %>% 
+  left_join(import_new, by=c("year", "cntry"))
 
+import <- import %>% 
+  mutate(difference = new_value / old_value)
 
+import %>% write_rds(here("proc", "import_comtrade_data_transition_loss.rds"))
+# result: retains at least 94%.
 
+export <- export_data %>% 
+  group_by(year, cntry) %>% 
+  summarise(old_value = sum(value)) %>% 
+  ungroup()
 
-# hs07 to cpc2
+export_new <- export_data_crosswalk %>% 
+  group_by(year, cntry) %>% 
+  summarise(new_value = sum(value)) %>% 
+  ungroup()
 
-chn_from_world_import2001 <- chn_from_world_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
+export <- export %>% 
+  left_join(export_new, by=c("year", "cntry"))
 
-chn_from_world_import2001 <- chn_from_world_import2001 %>% group_by(HS_2007) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
+export <- export %>% 
+  mutate(difference = new_value / old_value)
 
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
+export %>% write_rds(here("proc", "export_comtrade_data_transition_loss.rds"))
 
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
+# result: retains at least 88~91%.
 
+#--------------------
+# Download the final comtrade data that we transfromed from hs code to ksic10.
+#--------------------
 
-chn_from_world_import2001_1 <- chn_from_world_import2001 %>% filter(!(HS_2007 %in% check))  
-
-chn_from_world_import2001_2 <- chn_from_world_import2001 %>% filter(HS_2007 %in% check)  
-
-chn_from_world_import2001_1 <- chn_from_world_import2001_1 %>% 
-  left_join(hs07_cpc2_1, by=c("HS_2007"="HS07Code")) %>% select(-HS_2007)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(chn_from_world_import2001_2, by=c("HS07Code"="HS_2007")) %>% select(-HS07Code) 
-
-
-chn_from_world_import2001 <- chn_from_world_import2001_1 %>% 
-  bind_rows(hs07_cpc2_2) %>% filter(!is.na(Cifvalue), !is.na(CPC2Code)) 
-
-chn_from_world_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2001_cpc2.dta"))
-
-
-
-
-
-
-
-jpn_from_chn_import2001 <- jpn_from_chn_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_from_chn_import2001 <- jpn_from_chn_import2001 %>% group_by(HS_2007) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-jpn_from_chn_import2001_1 <- jpn_from_chn_import2001 %>% filter(!(HS_2007 %in% check))  
-
-jpn_from_chn_import2001_2 <- jpn_from_chn_import2001 %>% filter(HS_2007 %in% check)  
-
-jpn_from_chn_import2001_1 <- jpn_from_chn_import2001_1 %>% 
-  left_join(hs07_cpc2_1, by=c("HS_2007"="HS07Code")) %>% select(-HS_2007)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(jpn_from_chn_import2001_2, by=c("HS07Code"="HS_2007")) %>% select(-HS07Code) 
-
-
-jpn_from_chn_import2001 <- jpn_from_chn_import2001_1 %>% 
-  bind_rows(hs07_cpc2_2) %>%  filter(!is.na(Cifvalue), !is.na(CPC2Code))
-
-jpn_from_chn_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2001_cpc2.dta"))
-
-
-
-
-kor_from_chn_import2001 <- kor_from_chn_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-kor_from_chn_import2001 <- kor_from_chn_import2001 %>% group_by(HS_2007) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-kor_from_chn_import2001_1 <-kor_from_chn_import2001  %>% filter(!(HS_2007 %in% check))  
-
-kor_from_chn_import2001_2 <- kor_from_chn_import2001 %>% filter(HS_2007 %in% check)  
-
-kor_from_chn_import2001_1 <- kor_from_chn_import2001_1 %>% 
-  left_join(hs07_cpc2_1, by=c("HS_2007"="HS07Code")) %>% select(-HS_2007)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(kor_from_chn_import2001_2, by=c("HS07Code"="HS_2007")) %>% select(-HS07Code) 
-
-
-kor_from_chn_import2001 <- kor_from_chn_import2001_1 %>% 
-  bind_rows(hs07_cpc2_2) %>%  filter(!is.na(Cifvalue), !is.na(CPC2Code))
-
-kor_from_chn_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2001_cpc2.dta"))
-
-
-
-
-
-
-
-
-chn_to_world_export2001 <- chn_to_world_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-chn_to_world_export2001 <-chn_to_world_export2001  %>% group_by(HS_2007) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-chn_to_world_export2001_1 <- chn_to_world_export2001 %>% filter(!(HS_2007 %in% check))  
-
-chn_to_world_export2001_2 <-chn_to_world_export2001  %>% filter(HS_2007 %in% check)  
-
-chn_to_world_export2001_1 <- chn_to_world_export2001_1 %>% 
-  left_join(hs07_cpc2_1, by=c("HS_2007"="HS07Code")) %>% select(-HS_2007)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(chn_to_world_export2001_2, by=c("HS07Code"="HS_2007")) %>% select(-HS07Code) 
-
-
-chn_to_world_export2001 <- chn_to_world_export2001_1 %>% 
-  bind_rows(hs07_cpc2_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC2Code))
-
-chn_to_world_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2001_cpc2.dta"))
-
-
-
-
-jpn_to_chn_export2001 <- jpn_to_chn_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_to_chn_export2001 <-jpn_to_chn_export2001  %>% group_by(HS_2007) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-jpn_to_chn_export2001_1 <- jpn_to_chn_export2001 %>% filter(!(HS_2007 %in% check))  
-
-jpn_to_chn_export2001_2 <-jpn_to_chn_export2001  %>% filter(HS_2007 %in% check)  
-
-jpn_to_chn_export2001_1 <- jpn_to_chn_export2001_1 %>% 
-  left_join(hs07_cpc2_1, by=c("HS_2007"="HS07Code")) %>% select(-HS_2007)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(jpn_to_chn_export2001_2, by=c("HS07Code"="HS_2007")) %>% select(-HS07Code) 
-
-
-jpn_to_chn_export2001 <- jpn_to_chn_export2001_1 %>% 
-  bind_rows(hs07_cpc2_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC2Code))
-
-jpn_to_chn_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2001_cpc2.dta"))
-
-
-
-
-
-kor_to_chn_export2001 <- kor_to_chn_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-kor_to_chn_export2001 <-kor_to_chn_export2001  %>% group_by(HS_2007) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-kor_to_chn_export2001_1 <- kor_to_chn_export2001 %>% filter(!(HS_2007 %in% check))  
-
-kor_to_chn_export2001_2 <-kor_to_chn_export2001  %>% filter(HS_2007 %in% check)  
-
-kor_to_chn_export2001_1 <- kor_to_chn_export2001_1 %>% 
-  left_join(hs07_cpc2_1, by=c("HS_2007"="HS07Code")) %>% select(-HS_2007)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(kor_to_chn_export2001_2, by=c("HS07Code"="HS_2007")) %>% select(-HS07Code) 
-
-
-kor_to_chn_export2001 <- kor_to_chn_export2001_1 %>% 
-  bind_rows(hs07_cpc2_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC2Code))
-
-kor_to_chn_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2001_cpc2.dta"))
-
-
-
-
-
-
-
-
-# cpc2 to cpc21
-
-chn_from_world_import2001 <- chn_from_world_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-chn_from_world_import2001 <- chn_from_world_import2001 %>% group_by(CPC2Code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-chn_from_world_import2001_1 <- chn_from_world_import2001 %>% filter(!(CPC2Code %in% check))  
-
-chn_from_world_import2001_2 <- chn_from_world_import2001 %>% filter(CPC2Code %in% check)  
-
-chn_from_world_import2001_1 <- chn_from_world_import2001_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(chn_from_world_import2001_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-
-chn_from_world_import2001 <- chn_from_world_import2001_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>% filter(!is.na(Cifvalue), !is.na(CPC21code))
-
-
-chn_from_world_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2001_cpc21.dta"))
-
-
-
-
-
-
-
-jpn_from_chn_import2001 <- jpn_from_chn_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_from_chn_import2001 <- jpn_from_chn_import2001 %>% group_by(CPC2Code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-jpn_from_chn_import2001_1 <- jpn_from_chn_import2001 %>% filter(!(CPC2Code %in% check))  
-
-jpn_from_chn_import2001_2 <- jpn_from_chn_import2001 %>% filter(CPC2Code %in% check)  
-
-jpn_from_chn_import2001_1 <- jpn_from_chn_import2001_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(jpn_from_chn_import2001_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-
-jpn_from_chn_import2001 <- jpn_from_chn_import2001_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>%  filter(!is.na(Cifvalue), !is.na(CPC21code))
-
-jpn_from_chn_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2001_cpc21.dta"))
-
-
-
-
-kor_from_chn_import2001 <- kor_from_chn_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-kor_from_chn_import2001 <- kor_from_chn_import2001 %>% group_by(CPC2Code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-kor_from_chn_import2001_1 <-kor_from_chn_import2001  %>% filter(!(CPC2Code %in% check))  
-
-kor_from_chn_import2001_2 <- kor_from_chn_import2001 %>% filter(CPC2Code %in% check)  
-
-kor_from_chn_import2001_1 <- kor_from_chn_import2001_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(kor_from_chn_import2001_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-
-kor_from_chn_import2001 <- kor_from_chn_import2001_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>%  filter(!is.na(Cifvalue), !is.na(CPC21code))
-
-kor_from_chn_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2001_cpc21.dta"))
-
-
-
-
-
-
-
-
-chn_to_world_export2001 <- chn_to_world_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-chn_to_world_export2001 <-chn_to_world_export2001  %>% group_by(CPC2Code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-chn_to_world_export2001_1 <- chn_to_world_export2001 %>% filter(!(CPC2Code %in% check))  
-
-chn_to_world_export2001_2 <-chn_to_world_export2001  %>% filter(CPC2Code %in% check)  
-
-chn_to_world_export2001_1 <- chn_to_world_export2001_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(chn_to_world_export2001_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-chn_to_world_export2001 <- chn_to_world_export2001_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC21code))
-
-chn_to_world_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2001_cpc21.dta"))
-
-
-
-
-jpn_to_chn_export2001 <- jpn_to_chn_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_to_chn_export2001 <-jpn_to_chn_export2001  %>% group_by(CPC2Code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-jpn_to_chn_export2001_1 <- jpn_to_chn_export2001 %>% filter(!(CPC2Code %in% check))  
-
-jpn_to_chn_export2001_2 <-jpn_to_chn_export2001  %>% filter(CPC2Code %in% check)  
-
-jpn_to_chn_export2001_1 <- jpn_to_chn_export2001_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(jpn_to_chn_export2001_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-
-jpn_to_chn_export2001 <- jpn_to_chn_export2001_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC21code))
-
-jpn_to_chn_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2001_cpc21.dta"))
-
-
-
-
-
-kor_to_chn_export2001 <- kor_to_chn_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-kor_to_chn_export2001 <-kor_to_chn_export2001  %>% group_by(CPC2Code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-kor_to_chn_export2001_1 <- kor_to_chn_export2001 %>% filter(!(CPC2Code %in% check))  
-
-kor_to_chn_export2001_2 <-kor_to_chn_export2001  %>% filter(CPC2Code %in% check)  
-
-kor_to_chn_export2001_1 <- kor_to_chn_export2001_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(kor_to_chn_export2001_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-
-kor_to_chn_export2001 <- kor_to_chn_export2001_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC21code))
-
-kor_to_chn_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2001_cpc21.dta"))
-
-
-
-
-
-
-
-
-
-# cpc21 to ksic10
-
-chn_from_world_import2001 <- chn_from_world_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-chn_from_world_import2001 <- chn_from_world_import2001 %>% group_by(CPC21code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-chn_from_world_import2001_1 <- chn_from_world_import2001 %>% filter(!(CPC21code %in% check))  
-
-chn_from_world_import2001_2 <- chn_from_world_import2001 %>% filter(CPC21code %in% check)  
-
-chn_from_world_import2001_1 <- chn_from_world_import2001_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(chn_from_world_import2001_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-chn_from_world_import2001 <- chn_from_world_import2001_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>% filter(!is.na(Cifvalue), !is.na(ksic10))
-
-
-chn_from_world_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2001_ksic10.dta"))
-
-
-
-
-
-
-
-jpn_from_chn_import2001 <- jpn_from_chn_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_from_chn_import2001 <- jpn_from_chn_import2001 %>% group_by(CPC21code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-jpn_from_chn_import2001_1 <- jpn_from_chn_import2001 %>% filter(!(CPC21code %in% check))  
-
-jpn_from_chn_import2001_2 <- jpn_from_chn_import2001 %>% filter(CPC21code %in% check)  
-
-jpn_from_chn_import2001_1 <- jpn_from_chn_import2001_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(jpn_from_chn_import2001_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-jpn_from_chn_import2001 <- jpn_from_chn_import2001_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Cifvalue), !is.na(ksic10))
-
-jpn_from_chn_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2001_ksic10.dta"))
-
-
-
-
-kor_from_chn_import2001 <- kor_from_chn_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-kor_from_chn_import2001 <- kor_from_chn_import2001 %>% group_by(CPC21code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-kor_from_chn_import2001_1 <-kor_from_chn_import2001  %>% filter(!(CPC21code %in% check))  
-
-kor_from_chn_import2001_2 <- kor_from_chn_import2001 %>% filter(CPC21code %in% check)  
-
-kor_from_chn_import2001_1 <- kor_from_chn_import2001_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(kor_from_chn_import2001_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-kor_from_chn_import2001 <- kor_from_chn_import2001_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Cifvalue), !is.na(ksic10))
-
-kor_from_chn_import2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2001_ksic10.dta"))
-
-
-
-
-
-
-
-
-chn_to_world_export2001 <- chn_to_world_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-chn_to_world_export2001 <-chn_to_world_export2001  %>% group_by(CPC21code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-chn_to_world_export2001_1 <- chn_to_world_export2001 %>% filter(!(CPC21code %in% check))  
-
-chn_to_world_export2001_2 <-chn_to_world_export2001  %>% filter(CPC21code %in% check)  
-
-chn_to_world_export2001_1 <- chn_to_world_export2001_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(chn_to_world_export2001_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-chn_to_world_export2001 <- chn_to_world_export2001_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Fobvalue), !is.na(ksic10))
-
-chn_to_world_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2001_ksic10.dta"))
-
-
-
-
-jpn_to_chn_export2001 <- jpn_to_chn_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_to_chn_export2001 <-jpn_to_chn_export2001  %>% group_by(CPC21code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-jpn_to_chn_export2001_1 <- jpn_to_chn_export2001 %>% filter(!(CPC21code %in% check))  
-
-jpn_to_chn_export2001_2 <-jpn_to_chn_export2001  %>% filter(CPC21code %in% check)  
-
-jpn_to_chn_export2001_1 <- jpn_to_chn_export2001_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(jpn_to_chn_export2001_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-jpn_to_chn_export2001 <- jpn_to_chn_export2001_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Fobvalue), !is.na(ksic10))
-
-jpn_to_chn_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2001_ksic10.dta"))
-
-
-
-
-
-kor_to_chn_export2001 <- kor_to_chn_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-kor_to_chn_export2001 <-kor_to_chn_export2001  %>% group_by(CPC21code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-kor_to_chn_export2001_1 <- kor_to_chn_export2001 %>% filter(!(CPC21code %in% check))  
-
-kor_to_chn_export2001_2 <-kor_to_chn_export2001  %>% filter(CPC21code %in% check)  
-
-kor_to_chn_export2001_1 <- kor_to_chn_export2001_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(kor_to_chn_export2001_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-kor_to_chn_export2001 <- kor_to_chn_export2001_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Fobvalue), !is.na(ksic10))
-
-kor_to_chn_export2001 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2001_ksic10.dta"))
-
-
-
-
-
-# cpc21 to ksic10 save
-
-chn_from_world_import2001 <- chn_from_world_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-
-chn_from_world_import2001 %>% group_by(ksic10) %>% summarise(Cifvalue=sum(Cifvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2001_ksic10.dta"))
-
-
-
-
-
-
-
-jpn_from_chn_import2001 <- jpn_from_chn_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-
-jpn_from_chn_import2001 %>%  group_by(ksic10) %>% summarise(Cifvalue=sum(Cifvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2001_ksic10.dta"))
-
-
-
-
-kor_from_chn_import2001 <- kor_from_chn_import2001 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-kor_from_chn_import2001 %>%  group_by(ksic10) %>% summarise(Cifvalue=sum(Cifvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2001_ksic10.dta"))
-
-
-
-
-
-
-
-
-chn_to_world_export2001 <- chn_to_world_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-chn_to_world_export2001 %>%  group_by(ksic10) %>% summarise(Fobvalue=sum(Fobvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2001_ksic10.dta"))
-
-
-
-
-jpn_to_chn_export2001 <- jpn_to_chn_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_to_chn_export2001 %>%  group_by(ksic10) %>% summarise(Fobvalue=sum(Fobvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2001_ksic10.dta"))
-
-
-
-
-
-kor_to_chn_export2001 <- kor_to_chn_export2001 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-kor_to_chn_export2001 %>%  group_by(ksic10) %>% summarise(Fobvalue=sum(Fobvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2001_ksic10.dta"))
-
-
-
-# year 2010
-
-# hs07 to cpc2
-
-
-
-chn_from_world_import2010 <- chn_from_world_import2010 %>% group_by(CmdCode) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-chn_from_world_import2010_1 <- chn_from_world_import2010 %>% filter(!(CmdCode %in% check))  
-
-chn_from_world_import2010_2 <- chn_from_world_import2010 %>% filter(CmdCode %in% check)  
-
-chn_from_world_import2010_1 <- chn_from_world_import2010_1 %>% 
-  left_join(hs07_cpc2_1, by=c("CmdCode"="HS07Code")) %>% select(-CmdCode)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(chn_from_world_import2010_2, by=c("HS07Code"="CmdCode")) %>% select(-HS07Code) 
-
-
-chn_from_world_import2010 <- chn_from_world_import2010_1 %>% 
-  bind_rows(hs07_cpc2_2) %>% filter(!is.na(Cifvalue), !is.na(CPC2Code)) 
-
-chn_from_world_import2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2010_cpc2.dta"))
-
-
-
-
-
-
-
-
-jpn_from_chn_import2010 <- jpn_from_chn_import2010 %>% group_by(CmdCode) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-jpn_from_chn_import2010_1 <- jpn_from_chn_import2010 %>% filter(!(CmdCode %in% check))  
-
-jpn_from_chn_import2010_2 <- jpn_from_chn_import2010 %>% filter(CmdCode %in% check)  
-
-jpn_from_chn_import2010_1 <- jpn_from_chn_import2010_1 %>% 
-  left_join(hs07_cpc2_1, by=c("CmdCode"="HS07Code")) %>% select(-CmdCode)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(jpn_from_chn_import2010_2, by=c("HS07Code"="CmdCode")) %>% select(-HS07Code) 
-
-
-jpn_from_chn_import2010 <- jpn_from_chn_import2010_1 %>% 
-  bind_rows(hs07_cpc2_2) %>%  filter(!is.na(Cifvalue), !is.na(CPC2Code))
-
-jpn_from_chn_import2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2010_cpc2.dta"))
-
-
-
-
-
-kor_from_chn_import2010 <- kor_from_chn_import2010 %>% group_by(CmdCode) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-kor_from_chn_import2010_1 <-kor_from_chn_import2010  %>% filter(!(CmdCode %in% check))  
-
-kor_from_chn_import2010_2 <- kor_from_chn_import2010 %>% filter(CmdCode %in% check)  
-
-kor_from_chn_import2010_1 <- kor_from_chn_import2010_1 %>% 
-  left_join(hs07_cpc2_1, by=c("CmdCode"="HS07Code")) %>% select(-CmdCode)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(kor_from_chn_import2010_2, by=c("HS07Code"="CmdCode")) %>% select(-HS07Code) 
-
-
-kor_from_chn_import2010 <- kor_from_chn_import2010_1 %>% 
-  bind_rows(hs07_cpc2_2) %>%  filter(!is.na(Cifvalue), !is.na(CPC2Code))
-
-kor_from_chn_import2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2010_cpc2.dta"))
-
-
-
-
-
-
-
-
-
-chn_to_world_export2010 <-chn_to_world_export2010  %>% group_by(CmdCode) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-chn_to_world_export2010_1 <- chn_to_world_export2010 %>% filter(!(CmdCode %in% check))  
-
-chn_to_world_export2010_2 <-chn_to_world_export2010  %>% filter(CmdCode %in% check)  
-
-chn_to_world_export2010_1 <- chn_to_world_export2010_1 %>% 
-  left_join(hs07_cpc2_1, by=c("CmdCode"="HS07Code")) %>% select(-CmdCode)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(chn_to_world_export2010_2, by=c("HS07Code"="CmdCode")) %>% select(-HS07Code) 
-
-
-chn_to_world_export2010 <- chn_to_world_export2010_1 %>% 
-  bind_rows(hs07_cpc2_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC2Code))
-
-chn_to_world_export2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2010_cpc2.dta"))
-
-
-
-
-
-jpn_to_chn_export2010 <-jpn_to_chn_export2010  %>% group_by(CmdCode) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-jpn_to_chn_export2010_1 <- jpn_to_chn_export2010 %>% filter(!(CmdCode %in% check))  
-
-jpn_to_chn_export2010_2 <-jpn_to_chn_export2010  %>% filter(CmdCode %in% check)  
-
-jpn_to_chn_export2010_1 <- jpn_to_chn_export2010_1 %>% 
-  left_join(hs07_cpc2_1, by=c("CmdCode"="HS07Code")) %>% select(-CmdCode)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(jpn_to_chn_export2010_2, by=c("HS07Code"="CmdCode")) %>% select(-HS07Code) 
-
-
-jpn_to_chn_export2010 <- jpn_to_chn_export2010_1 %>% 
-  bind_rows(hs07_cpc2_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC2Code))
-
-jpn_to_chn_export2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2010_cpc2.dta"))
-
-
-
-
-
-kor_to_chn_export2010 <-kor_to_chn_export2010  %>% group_by(CmdCode) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-hs07_cpc2_1 <- hs07_cpc2 %>% filter(weight==1)
-hs07_cpc2_2 <- hs07_cpc2 %>% filter(weight!=1)
-
-check <- hs07_cpc2_2 %>% distinct(HS07Code) %>% pull(HS07Code)
-
-
-kor_to_chn_export2010_1 <- kor_to_chn_export2010 %>% filter(!(CmdCode %in% check))  
-
-kor_to_chn_export2010_2 <-kor_to_chn_export2010  %>% filter(CmdCode %in% check)  
-
-kor_to_chn_export2010_1 <- kor_to_chn_export2010_1 %>% 
-  left_join(hs07_cpc2_1, by=c("CmdCode"="HS07Code")) %>% select(-CmdCode)
-
-hs07_cpc2_2 <- hs07_cpc2_2 %>% 
-  left_join(kor_to_chn_export2010_2, by=c("HS07Code"="CmdCode")) %>% select(-HS07Code) 
-
-
-kor_to_chn_export2010 <- kor_to_chn_export2010_1 %>% 
-  bind_rows(hs07_cpc2_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC2Code))
-
-kor_to_chn_export2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2010_cpc2.dta"))
-
-
-
-
-
-
-
-# cpc2 to cpc21
-
-chn_from_world_import2010 <- chn_from_world_import2010 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-chn_from_world_import2010 <- chn_from_world_import2010 %>% group_by(CPC2Code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-chn_from_world_import2010_1 <- chn_from_world_import2010 %>% filter(!(CPC2Code %in% check))  
-
-chn_from_world_import2010_2 <- chn_from_world_import2010 %>% filter(CPC2Code %in% check)  
-
-chn_from_world_import2010_1 <- chn_from_world_import2010_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(chn_from_world_import2010_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-
-chn_from_world_import2010 <- chn_from_world_import2010_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>% filter(!is.na(Cifvalue), !is.na(CPC21code))
-
-
-chn_from_world_import2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2010_cpc21.dta"))
-
-
-
-
-
-
-
-jpn_from_chn_import2010 <- jpn_from_chn_import2010 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_from_chn_import2010 <- jpn_from_chn_import2010 %>% group_by(CPC2Code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-jpn_from_chn_import2010_1 <- jpn_from_chn_import2010 %>% filter(!(CPC2Code %in% check))  
-
-jpn_from_chn_import2010_2 <- jpn_from_chn_import2010 %>% filter(CPC2Code %in% check)  
-
-jpn_from_chn_import2010_1 <- jpn_from_chn_import2010_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(jpn_from_chn_import2010_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-
-jpn_from_chn_import2010 <- jpn_from_chn_import2010_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>%  filter(!is.na(Cifvalue), !is.na(CPC21code))
-
-jpn_from_chn_import2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2010_cpc21.dta"))
-
-
-
-
-kor_from_chn_import2010 <- kor_from_chn_import2010 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-kor_from_chn_import2010 <- kor_from_chn_import2010 %>% group_by(CPC2Code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-kor_from_chn_import2010_1 <-kor_from_chn_import2010  %>% filter(!(CPC2Code %in% check))  
-
-kor_from_chn_import2010_2 <- kor_from_chn_import2010 %>% filter(CPC2Code %in% check)  
-
-kor_from_chn_import2010_1 <- kor_from_chn_import2010_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(kor_from_chn_import2010_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-
-kor_from_chn_import2010 <- kor_from_chn_import2010_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>%  filter(!is.na(Cifvalue), !is.na(CPC21code))
-
-kor_from_chn_import2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2010_cpc21.dta"))
-
-
-
-
-
-
-
-
-chn_to_world_export2010 <- chn_to_world_export2010 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-chn_to_world_export2010 <-chn_to_world_export2010  %>% group_by(CPC2Code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-chn_to_world_export2010_1 <- chn_to_world_export2010 %>% filter(!(CPC2Code %in% check))  
-
-chn_to_world_export2010_2 <-chn_to_world_export2010  %>% filter(CPC2Code %in% check)  
-
-chn_to_world_export2010_1 <- chn_to_world_export2010_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(chn_to_world_export2010_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-chn_to_world_export2010 <- chn_to_world_export2010_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC21code))
-
-chn_to_world_export2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2010_cpc21.dta"))
-
-
-
-
-jpn_to_chn_export2010 <- jpn_to_chn_export2010 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_to_chn_export2010 <-jpn_to_chn_export2010  %>% group_by(CPC2Code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-jpn_to_chn_export2010_1 <- jpn_to_chn_export2010 %>% filter(!(CPC2Code %in% check))  
-
-jpn_to_chn_export2010_2 <-jpn_to_chn_export2010  %>% filter(CPC2Code %in% check)  
-
-jpn_to_chn_export2010_1 <- jpn_to_chn_export2010_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(jpn_to_chn_export2010_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-
-jpn_to_chn_export2010 <- jpn_to_chn_export2010_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC21code))
-
-jpn_to_chn_export2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2010_cpc21.dta"))
-
-
-
-
-
-kor_to_chn_export2010 <- kor_to_chn_export2010 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-kor_to_chn_export2010 <-kor_to_chn_export2010  %>% group_by(CPC2Code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc2_cpc21_1 <- cpc2_cpc21 %>% filter(weight==1)
-cpc2_cpc21_2 <- cpc2_cpc21 %>% filter(weight!=1)
-
-check <- cpc2_cpc21_2 %>% distinct(CPC2code) %>% pull(CPC2code)
-
-
-kor_to_chn_export2010_1 <- kor_to_chn_export2010 %>% filter(!(CPC2Code %in% check))  
-
-kor_to_chn_export2010_2 <-kor_to_chn_export2010  %>% filter(CPC2Code %in% check)  
-
-kor_to_chn_export2010_1 <- kor_to_chn_export2010_1 %>% 
-  left_join(cpc2_cpc21_1, by=c("CPC2Code"="CPC2code")) %>% select(-CPC2Code)
-
-cpc2_cpc21_2 <- cpc2_cpc21_2 %>% 
-  left_join(kor_to_chn_export2010_2, by=c("CPC2code"="CPC2Code")) %>% select(-CPC2code) 
-
-
-kor_to_chn_export2010 <- kor_to_chn_export2010_1 %>% 
-  bind_rows(cpc2_cpc21_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC21code))
-
-kor_to_chn_export2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2010_cpc21.dta"))
-
-
-
-
-
-
-
-
-
-# cpc21 to ksic10
-
-chn_from_world_import2010 <- chn_from_world_import2010 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-chn_from_world_import2010 <- chn_from_world_import2010 %>% group_by(CPC21code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-chn_from_world_import2010_1 <- chn_from_world_import2010 %>% filter(!(CPC21code %in% check))  
-
-chn_from_world_import2010_2 <- chn_from_world_import2010 %>% filter(CPC21code %in% check)  
-
-chn_from_world_import2010_1 <- chn_from_world_import2010_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(chn_from_world_import2010_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-chn_from_world_import2010 <- chn_from_world_import2010_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>% filter(!is.na(Cifvalue), !is.na(ksic10))
-
-
-chn_from_world_import2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2010_ksic10.dta"))
-
-
-
-
-
-
-
-jpn_from_chn_import2010 <- jpn_from_chn_import2010 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_from_chn_import2010 <- jpn_from_chn_import2010 %>% group_by(CPC21code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-jpn_from_chn_import2010_1 <- jpn_from_chn_import2010 %>% filter(!(CPC21code %in% check))  
-
-jpn_from_chn_import2010_2 <- jpn_from_chn_import2010 %>% filter(CPC21code %in% check)  
-
-jpn_from_chn_import2010_1 <- jpn_from_chn_import2010_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(jpn_from_chn_import2010_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-jpn_from_chn_import2010 <- jpn_from_chn_import2010_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Cifvalue), !is.na(ksic10))
-
-jpn_from_chn_import2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2010_ksic10.dta"))
-
-
-
-
-kor_from_chn_import2010 <- kor_from_chn_import2010 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-kor_from_chn_import2010 <- kor_from_chn_import2010 %>% group_by(CPC21code) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-kor_from_chn_import2010_1 <-kor_from_chn_import2010  %>% filter(!(CPC21code %in% check))  
-
-kor_from_chn_import2010_2 <- kor_from_chn_import2010 %>% filter(CPC21code %in% check)  
-
-kor_from_chn_import2010_1 <- kor_from_chn_import2010_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(kor_from_chn_import2010_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-kor_from_chn_import2010 <- kor_from_chn_import2010_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Cifvalue), !is.na(ksic10))
-
-kor_from_chn_import2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2010_ksic10.dta"))
-
-
-
-
-
-
-
-
-chn_to_world_export2010 <- chn_to_world_export2010 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-chn_to_world_export2010 <-chn_to_world_export2010  %>% group_by(CPC21code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-chn_to_world_export2010_1 <- chn_to_world_export2010 %>% filter(!(CPC21code %in% check))  
-
-chn_to_world_export2010_2 <-chn_to_world_export2010  %>% filter(CPC21code %in% check)  
-
-chn_to_world_export2010_1 <- chn_to_world_export2010_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(chn_to_world_export2010_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-chn_to_world_export2010 <- chn_to_world_export2010_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Fobvalue), !is.na(ksic10))
-
-chn_to_world_export2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2010_ksic10.dta"))
-
-
-
-
-jpn_to_chn_export2010 <- jpn_to_chn_export2010 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_to_chn_export2010 <-jpn_to_chn_export2010  %>% group_by(CPC21code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-jpn_to_chn_export2010_1 <- jpn_to_chn_export2010 %>% filter(!(CPC21code %in% check))  
-
-jpn_to_chn_export2010_2 <-jpn_to_chn_export2010  %>% filter(CPC21code %in% check)  
-
-jpn_to_chn_export2010_1 <- jpn_to_chn_export2010_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(jpn_to_chn_export2010_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-jpn_to_chn_export2010 <- jpn_to_chn_export2010_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Fobvalue), !is.na(ksic10))
-
-jpn_to_chn_export2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2010_ksic10.dta"))
-
-
-
-
-
-kor_to_chn_export2010 <- kor_to_chn_export2010 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-kor_to_chn_export2010 <-kor_to_chn_export2010  %>% group_by(CPC21code) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-kor_to_chn_export2010_1 <- kor_to_chn_export2010 %>% filter(!(CPC21code %in% check))  
-
-kor_to_chn_export2010_2 <-kor_to_chn_export2010  %>% filter(CPC21code %in% check)  
-
-kor_to_chn_export2010_1 <- kor_to_chn_export2010_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21code"="cpc21")) %>% select(-CPC21code)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(kor_to_chn_export2010_2, by=c("cpc21"="CPC21code")) %>% select(-cpc21) 
-
-
-kor_to_chn_export2010 <- kor_to_chn_export2010_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Fobvalue), !is.na(ksic10))
-
-kor_to_chn_export2010 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2010_ksic10.dta"))
-
-
-
-
-
-# cpc21 to ksic10 save
-
-chn_from_world_import2010 <- chn_from_world_import2010 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-
-chn_from_world_import2010 %>% group_by(ksic10) %>% summarise(Cifvalue=sum(Cifvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2010_ksic10.dta"))
-
-
-
-
-
-
-
-jpn_from_chn_import2010 <- jpn_from_chn_import2010 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-
-jpn_from_chn_import2010 %>%  group_by(ksic10) %>% summarise(Cifvalue=sum(Cifvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2010_ksic10.dta"))
-
-
-
-
-kor_from_chn_import2010 <- kor_from_chn_import2010 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-kor_from_chn_import2010 %>%  group_by(ksic10) %>% summarise(Cifvalue=sum(Cifvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2010_ksic10.dta"))
-
-
-
-
-
-
-
-
-chn_to_world_export2010 <- chn_to_world_export2010 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-chn_to_world_export2010 %>%  group_by(ksic10) %>% summarise(Fobvalue=sum(Fobvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2010_ksic10.dta"))
-
-
-
-
-jpn_to_chn_export2010 <- jpn_to_chn_export2010 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_to_chn_export2010 %>%  group_by(ksic10) %>% summarise(Fobvalue=sum(Fobvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2010_ksic10.dta"))
-
-
-
-
-
-kor_to_chn_export2010 <- kor_to_chn_export2010 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-kor_to_chn_export2010 %>%  group_by(ksic10) %>% summarise(Fobvalue=sum(Fobvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2010_ksic10.dta"))
-
-
-
-
-
-
-
-
-
-# year 2019-----
-
-
-# hs17 to cpc21
-
-
-chn_from_world_import2019 <- chn_from_world_import2019 %>% group_by(CmdCode) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-hs17_cpc21_1 <- hs17_cpc21 %>% filter(weight==1)
-hs17_cpc21_2 <- hs17_cpc21 %>% filter(weight!=1)
-
-check <- hs17_cpc21_2 %>% distinct(HS2017) %>% pull(HS2017)
-
-
-chn_from_world_import2019_1 <- chn_from_world_import2019 %>% filter(!(CmdCode %in% check))  
-
-chn_from_world_import2019_2 <- chn_from_world_import2019 %>% filter(CmdCode %in% check)  
-
-chn_from_world_import2019_1 <- chn_from_world_import2019_1 %>% 
-  left_join(hs17_cpc21_1, by=c("CmdCode"="HS2017")) %>% select(-CmdCode)
-
-hs17_cpc21_2 <- hs17_cpc21_2 %>% 
-  left_join(chn_from_world_import2019_2, by=c("HS2017"="CmdCode")) %>% select(-HS2017) 
-
-
-chn_from_world_import2019 <- chn_from_world_import2019_1 %>% 
-  bind_rows(hs17_cpc21_2) %>% filter(!is.na(Cifvalue), !is.na(CPC21)) 
-
-chn_from_world_import2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2019_cpc21.dta"))
-
-
-
-
-
-
-
-
-
-jpn_from_chn_import2019 <- jpn_from_chn_import2019 %>% group_by(CmdCode) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-hs17_cpc21_1 <- hs17_cpc21 %>% filter(weight==1)
-hs17_cpc21_2 <- hs17_cpc21 %>% filter(weight!=1)
-
-check <- hs17_cpc21_2 %>% distinct(HS2017) %>% pull(HS2017)
-
-
-jpn_from_chn_import2019_1 <- jpn_from_chn_import2019 %>% filter(!(CmdCode %in% check))  
-
-jpn_from_chn_import2019_2 <- jpn_from_chn_import2019 %>% filter(CmdCode %in% check)  
-
-jpn_from_chn_import2019_1 <- jpn_from_chn_import2019_1 %>% 
-  left_join(hs17_cpc21_1, by=c("CmdCode"="HS2017")) %>% select(-CmdCode)
-
-hs17_cpc21_2 <- hs17_cpc21_2 %>% 
-  left_join(jpn_from_chn_import2019_2, by=c("HS2017"="CmdCode")) %>% select(-HS2017) 
-
-
-jpn_from_chn_import2019 <- jpn_from_chn_import2019_1 %>% 
-  bind_rows(hs17_cpc21_2) %>%  filter(!is.na(Cifvalue), !is.na(CPC21))
-
-jpn_from_chn_import2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2019_cpc21.dta"))
-
-
-
-
-kor_from_chn_import2019 <- kor_from_chn_import2019 %>% group_by(CmdCode) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-hs17_cpc21_1 <- hs17_cpc21 %>% filter(weight==1)
-hs17_cpc21_2 <- hs17_cpc21 %>% filter(weight!=1)
-
-check <- hs17_cpc21_2 %>% distinct(HS2017) %>% pull(HS2017)
-
-
-kor_from_chn_import2019_1 <-kor_from_chn_import2019  %>% filter(!(CmdCode %in% check))  
-
-kor_from_chn_import2019_2 <- kor_from_chn_import2019 %>% filter(CmdCode %in% check)  
-
-kor_from_chn_import2019_1 <- kor_from_chn_import2019_1 %>% 
-  left_join(hs17_cpc21_1, by=c("CmdCode"="HS2017")) %>% select(-CmdCode)
-
-hs17_cpc21_2 <- hs17_cpc21_2 %>% 
-  left_join(kor_from_chn_import2019_2, by=c("HS2017"="CmdCode")) %>% select(-HS2017) 
-
-
-kor_from_chn_import2019 <- kor_from_chn_import2019_1 %>% 
-  bind_rows(hs17_cpc21_2) %>%  filter(!is.na(Cifvalue), !is.na(CPC21))
-
-kor_from_chn_import2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2019_cpc21.dta"))
-
-
-
-
-
-
-
-
-
-
-chn_to_world_export2019 <-chn_to_world_export2019  %>% group_by(CmdCode) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-hs17_cpc21_1 <- hs17_cpc21 %>% filter(weight==1)
-hs17_cpc21_2 <- hs17_cpc21 %>% filter(weight!=1)
-
-check <- hs17_cpc21_2 %>% distinct(HS2017) %>% pull(HS2017)
-
-
-chn_to_world_export2019_1 <- chn_to_world_export2019 %>% filter(!(CmdCode %in% check))  
-
-chn_to_world_export2019_2 <-chn_to_world_export2019  %>% filter(CmdCode %in% check)  
-
-chn_to_world_export2019_1 <- chn_to_world_export2019_1 %>% 
-  left_join(hs17_cpc21_1, by=c("CmdCode"="HS2017")) %>% select(-CmdCode)
-
-hs17_cpc21_2 <- hs17_cpc21_2 %>% 
-  left_join(chn_to_world_export2019_2, by=c("HS2017"="CmdCode")) %>% select(-HS2017) 
-
-
-chn_to_world_export2019 <- chn_to_world_export2019_1 %>% 
-  bind_rows(hs17_cpc21_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC21))
-
-chn_to_world_export2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2019_cpc21.dta"))
-
-
-
-
-
-jpn_to_chn_export2019 <-jpn_to_chn_export2019  %>% group_by(CmdCode) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-hs17_cpc21_1 <- hs17_cpc21 %>% filter(weight==1)
-hs17_cpc21_2 <- hs17_cpc21 %>% filter(weight!=1)
-
-check <- hs17_cpc21_2 %>% distinct(HS2017) %>% pull(HS2017)
-
-
-jpn_to_chn_export2019_1 <- jpn_to_chn_export2019 %>% filter(!(CmdCode %in% check))  
-
-jpn_to_chn_export2019_2 <-jpn_to_chn_export2019  %>% filter(CmdCode %in% check)  
-
-jpn_to_chn_export2019_1 <- jpn_to_chn_export2019_1 %>% 
-  left_join(hs17_cpc21_1, by=c("CmdCode"="HS2017")) %>% select(-CmdCode)
-
-hs17_cpc21_2 <- hs17_cpc21_2 %>% 
-  left_join(jpn_to_chn_export2019_2, by=c("HS2017"="CmdCode")) %>% select(-HS2017) 
-
-
-jpn_to_chn_export2019 <- jpn_to_chn_export2019_1 %>% 
-  bind_rows(hs17_cpc21_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC21))
-
-jpn_to_chn_export2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2019_cpc21.dta"))
-
-
-
-
-
-
-kor_to_chn_export2019 <-kor_to_chn_export2019  %>% group_by(CmdCode) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-hs17_cpc21_1 <- hs17_cpc21 %>% filter(weight==1)
-hs17_cpc21_2 <- hs17_cpc21 %>% filter(weight!=1)
-
-check <- hs17_cpc21_2 %>% distinct(HS2017) %>% pull(HS2017)
-
-
-kor_to_chn_export2019_1 <- kor_to_chn_export2019 %>% filter(!(CmdCode %in% check))  
-
-kor_to_chn_export2019_2 <-kor_to_chn_export2019  %>% filter(CmdCode %in% check)  
-
-kor_to_chn_export2019_1 <- kor_to_chn_export2019_1 %>% 
-  left_join(hs17_cpc21_1, by=c("CmdCode"="HS2017")) %>% select(-CmdCode)
-
-hs17_cpc21_2 <- hs17_cpc21_2 %>% 
-  left_join(kor_to_chn_export2019_2, by=c("HS2017"="CmdCode")) %>% select(-HS2017) 
-
-
-kor_to_chn_export2019 <- kor_to_chn_export2019_1 %>% 
-  bind_rows(hs17_cpc21_2) %>%  filter(!is.na(Fobvalue), !is.na(CPC21))
-
-kor_to_chn_export2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2019_cpc21.dta"))
-
-
-
-
-
-# cpc21 to ksic10
-
-chn_from_world_import2019 <- chn_from_world_import2019 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-chn_from_world_import2019 <- chn_from_world_import2019 %>% group_by(CPC21) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-chn_from_world_import2019_1 <- chn_from_world_import2019 %>% filter(!(CPC21 %in% check))  
-
-chn_from_world_import2019_2 <- chn_from_world_import2019 %>% filter(CPC21 %in% check)  
-
-chn_from_world_import2019_1 <- chn_from_world_import2019_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21"="cpc21")) %>% select(-CPC21)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(chn_from_world_import2019_2, by=c("cpc21"="CPC21")) %>% select(-cpc21) 
-
-
-chn_from_world_import2019 <- chn_from_world_import2019_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>% filter(!is.na(Cifvalue), !is.na(ksic10))
-
-
-chn_from_world_import2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2019_ksic10.dta"))
-
-
-
-
-
-
-
-jpn_from_chn_import2019 <- jpn_from_chn_import2019 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_from_chn_import2019 <- jpn_from_chn_import2019 %>% group_by(CPC21) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-jpn_from_chn_import2019_1 <- jpn_from_chn_import2019 %>% filter(!(CPC21 %in% check))  
-
-jpn_from_chn_import2019_2 <- jpn_from_chn_import2019 %>% filter(CPC21 %in% check)  
-
-jpn_from_chn_import2019_1 <- jpn_from_chn_import2019_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21"="cpc21")) %>% select(-CPC21)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(jpn_from_chn_import2019_2, by=c("cpc21"="CPC21")) %>% select(-cpc21) 
-
-
-jpn_from_chn_import2019 <- jpn_from_chn_import2019_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Cifvalue), !is.na(ksic10))
-
-jpn_from_chn_import2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2019_ksic10.dta"))
-
-
-
-
-kor_from_chn_import2019 <- kor_from_chn_import2019 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-kor_from_chn_import2019 <- kor_from_chn_import2019 %>% group_by(CPC21) %>% 
-  summarise(Cifvalue=sum(Cifvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-kor_from_chn_import2019_1 <-kor_from_chn_import2019  %>% filter(!(CPC21 %in% check))  
-
-kor_from_chn_import2019_2 <- kor_from_chn_import2019 %>% filter(CPC21 %in% check)  
-
-kor_from_chn_import2019_1 <- kor_from_chn_import2019_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21"="cpc21")) %>% select(-CPC21)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(kor_from_chn_import2019_2, by=c("cpc21"="CPC21")) %>% select(-cpc21) 
-
-
-kor_from_chn_import2019 <- kor_from_chn_import2019_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Cifvalue), !is.na(ksic10))
-
-kor_from_chn_import2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2019_ksic10.dta"))
-
-
-
-
-
-
-
-
-chn_to_world_export2019 <- chn_to_world_export2019 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-chn_to_world_export2019 <-chn_to_world_export2019  %>% group_by(CPC21) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-chn_to_world_export2019_1 <- chn_to_world_export2019 %>% filter(!(CPC21 %in% check))  
-
-chn_to_world_export2019_2 <-chn_to_world_export2019  %>% filter(CPC21 %in% check)  
-
-chn_to_world_export2019_1 <- chn_to_world_export2019_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21"="cpc21")) %>% select(-CPC21)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(chn_to_world_export2019_2, by=c("cpc21"="CPC21")) %>% select(-cpc21) 
-
-
-chn_to_world_export2019 <- chn_to_world_export2019_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Fobvalue), !is.na(ksic10))
-
-chn_to_world_export2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2019_ksic10.dta"))
-
-
-
-
-jpn_to_chn_export2019 <- jpn_to_chn_export2019 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_to_chn_export2019 <-jpn_to_chn_export2019  %>% group_by(CPC21) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-jpn_to_chn_export2019_1 <- jpn_to_chn_export2019 %>% filter(!(CPC21 %in% check))  
-
-jpn_to_chn_export2019_2 <-jpn_to_chn_export2019  %>% filter(CPC21 %in% check)  
-
-jpn_to_chn_export2019_1 <- jpn_to_chn_export2019_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21"="cpc21")) %>% select(-CPC21)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(jpn_to_chn_export2019_2, by=c("cpc21"="CPC21")) %>% select(-cpc21) 
-
-
-jpn_to_chn_export2019 <- jpn_to_chn_export2019_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Fobvalue), !is.na(ksic10))
-
-jpn_to_chn_export2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2019_ksic10.dta"))
-
-
-
-
-
-kor_to_chn_export2019 <- kor_to_chn_export2019 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-kor_to_chn_export2019 <-kor_to_chn_export2019  %>% group_by(CPC21) %>% 
-  summarise(Fobvalue=sum(Fobvalue, na.rm=T))
-
-cpc21_ksic10_1 <- cpc21_ksic10 %>% filter(weight==1)
-cpc21_ksic10_2 <- cpc21_ksic10 %>% filter(weight!=1)
-
-check <- cpc21_ksic10_2 %>% distinct(cpc21) %>% pull(cpc21)
-
-
-kor_to_chn_export2019_1 <- kor_to_chn_export2019 %>% filter(!(CPC21 %in% check))  
-
-kor_to_chn_export2019_2 <-kor_to_chn_export2019  %>% filter(CPC21 %in% check)  
-
-kor_to_chn_export2019_1 <- kor_to_chn_export2019_1 %>% 
-  left_join(cpc21_ksic10_1, by=c("CPC21"="cpc21")) %>% select(-CPC21)
-
-cpc21_ksic10_2 <- cpc21_ksic10_2 %>% 
-  left_join(kor_to_chn_export2019_2, by=c("cpc21"="CPC21")) %>% select(-cpc21) 
-
-
-kor_to_chn_export2019 <- kor_to_chn_export2019_1 %>% 
-  bind_rows(cpc21_ksic10_2) %>%  filter(!is.na(Fobvalue), !is.na(ksic10))
-
-kor_to_chn_export2019 %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2019_ksic10.dta"))
-
-
-
-
-
-# cpc21 to ksic10 save
-
-chn_from_world_import2019 <- chn_from_world_import2019 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-
-chn_from_world_import2019 %>% group_by(ksic10) %>% summarise(Cifvalue=sum(Cifvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_from_world_import2019_ksic10.dta"))
-
-
-
-
-
-
-
-jpn_from_chn_import2019 <- jpn_from_chn_import2019 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-
-jpn_from_chn_import2019 %>%  group_by(ksic10) %>% summarise(Cifvalue=sum(Cifvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_from_chn_import2019_ksic10.dta"))
-
-
-
-
-kor_from_chn_import2019 <- kor_from_chn_import2019 %>% mutate(Cifvalue=Cifvalue*weight) %>% 
-  select(-weight)
-
-
-kor_from_chn_import2019 %>%  group_by(ksic10) %>% summarise(Cifvalue=sum(Cifvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_from_chn_import2019_ksic10.dta"))
-
-
-
-
-
-
-
-
-chn_to_world_export2019 <- chn_to_world_export2019 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-chn_to_world_export2019 %>%  group_by(ksic10) %>% summarise(Fobvalue=sum(Fobvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "chn_to_world_export2019_ksic10.dta"))
-
-
-
-
-jpn_to_chn_export2019 <- jpn_to_chn_export2019 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-jpn_to_chn_export2019 %>%  group_by(ksic10) %>% summarise(Fobvalue=sum(Fobvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "jpn_to_chn_export2019_ksic10.dta"))
-
-
-
-
-
-kor_to_chn_export2019 <- kor_to_chn_export2019 %>% mutate(Fobvalue=Fobvalue*weight) %>% 
-  select(-weight)
-
-
-kor_to_chn_export2019 %>%  group_by(ksic10) %>% summarise(Fobvalue=sum(Fobvalue, na.rm=T)) %>% 
-  haven::write_dta(here("data", "final", "hs_cpc_ksic", "kor_to_chn_export2019_ksic10.dta"))
-
-
-
-
-
-
-
-
-
-
-
+import_data_crosswalk %>% write_rds(here("data", "temp", "import_data_ksic10.rds"))
+export_data_crosswalk %>% write_rds(here("data", "temp", "export_data_ksic10.rds"))
