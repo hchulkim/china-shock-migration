@@ -90,9 +90,42 @@ population <- population %>% filter(!is.na(iso))
    ungroup()
 
 # also get the net pop growth
+ 
+# read in cz data
+cz <- read_rds(here("proc", "commuting_zone.rds")) %>% 
+  select(iso, cz_id, cz_label)
+
+population <- population %>% 
+  left_join(cz, by="iso")
 
 # sigungu version
+population_growth_sigungu <- population %>% 
+  group_by(iso) %>% 
+  mutate(pop_lag = lag(pop)) %>% 
+  mutate(pop_gr = pop - pop_lag) %>% 
+  select(year, iso, cz_id, cz_label, pop_gr) %>% 
+  ungroup()
 
- 
+population_growth_sigungu %>% 
+  write_rds(here("data", "temp", "pop_growth_sigungu.rds"))
+
 # cz level
+
+population_growth_cz <- population %>% 
+  group_by(year, cz_id) %>% 
+  summarise(pop = sum(pop)) %>% 
+  ungroup()
+  
+  
+population_growth_cz <- population_growth_cz %>%  
+  group_by(cz_id) %>% 
+  mutate(pop_lag = lag(pop)) %>% 
+  mutate(pop_gr = pop - pop_lag) %>% 
+  select(year, cz_id, pop_gr) %>% 
+  ungroup()
+
+population_growth_cz %>% 
+  write_rds(here("data", "temp", "pop_growth_cz.rds"))
+
+
 
