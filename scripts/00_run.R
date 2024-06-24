@@ -12,6 +12,8 @@ concordance_02_comtrade_hs_ksic <- 1
 concordance_03_est_region_match <- 1
 concordance_04_est_ksic89_ksic10 <- 1
 concordance_06_exposure_construction <- 1 
+concordance_07_commutingzone_match <- 1
+concordance_08_population_region_matched <- 1
 
 # RUN SCRIPTS ---------------------------------------------------------------
 
@@ -29,3 +31,11 @@ if (concordance_04_est_ksic89_ksic10) source(here("scripts", "concordance_04_est
 
 # Construct local exposure to trade shock (x and z variable)
 if (concordance_06_exposure_construction) source(here("scripts", "concordance_06_exposure_construction.R"), encoding = "UTF-8")
+
+# Concords region to commuting zone.
+if (concordance_07_commutingzone_match ) source(here("scripts", "concordance_07_commutingzone_match .R"), encoding = "UTF-8")
+
+# Construct pop growth var by sigungu and cz.
+if (concordance_08_population_region_matche) source(here("scripts", "concordance_08_population_region_matche.R"), encoding = "UTF-8")
+
+
