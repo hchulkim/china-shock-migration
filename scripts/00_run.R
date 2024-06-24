@@ -11,6 +11,7 @@ concordance_01_hs_cpc_ksic <- 1
 concordance_02_comtrade_hs_ksic <- 1
 concordance_03_est_region_match <- 1
 concordance_04_est_ksic89_ksic10 <- 1
+concordance_06_exposure_construction <- 1 
 
 # RUN SCRIPTS ---------------------------------------------------------------
 
@@ -25,3 +26,6 @@ if (concordance_03_est_region_match) source(here("scripts", "concordance_03_est_
 
 # Use concordance table to match industry code ksic in est data to ksic10.
 if (concordance_04_est_ksic89_ksic10) source(here("scripts", "concordance_04_est_ksic89_ksic10.R"), encoding = "UTF-8")
+
+# Construct local exposure to trade shock (x and z variable)
+if (concordance_06_exposure_construction) source(here("scripts", "concordance_06_exposure_construction.R"), encoding = "UTF-8")
