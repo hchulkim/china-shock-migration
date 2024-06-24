@@ -17,12 +17,17 @@ export_data <- read_rds(here("data", "temp", "export_data_ksic10.rds"))
 
 est_data <- read_rds(here("data", "temp", "est_region_industry_matched.rds"))
 
+cz <- read_rds(here("proc", "commuting_zone.rds"))
+
+est_data <- est_data %>% 
+  left_join(cz %>% select(iso, cz_id), by="iso")
+
 
 #-------------------- 
 # construct s_{lnt} : share of manufacturing industry n in total employment in location l
 #-------------------- 
 s_lnt <- est_data %>% 
-  group_by(iso, year) %>% 
+  group_by(cz_id, year) %>% 
   mutate(emp_total = sum(emp_all)) %>% 
   ungroup()
 
@@ -131,7 +136,7 @@ x_lt <- s_lnt %>%
 
 x_lt <- x_lt %>% 
   mutate(local_x_lt = sh_lnt * gr_nt) %>% 
-  group_by(iso, year, type) %>% 
+  group_by(cz_id, year, type) %>% 
   summarise(local_x_lt = sum(local_x_lt, na.rm = T)) %>% 
   ungroup()
 x_lt <- x_lt %>% filter(year>=2010, year<2020)
@@ -143,7 +148,7 @@ z_lt <- s_lnt %>% filter(year == 1999) %>% select(-year) %>%
 
 z_lt <- z_lt %>% 
   mutate(local_z_lt = sh_lnt * gr_nt_iv) %>% 
-  group_by(iso, year, type) %>% 
+  group_by(cz_id, year, type) %>% 
   summarise(local_z_lt = sum(local_z_lt, na.rm = T)) %>% 
   ungroup()
 
@@ -153,6 +158,6 @@ z_lt <- z_lt %>% filter(!is.na(year))
 # merge the data and save it
 
 final_data <- x_lt %>% 
-  left_join(z_lt, by=c("iso", "year", "type"))
+  left_join(z_lt, by=c("cz_id", "year", "type"))
 final_data %>% 
   write_rds(here("data", "temp", "local_exposure_data.rds"))
