@@ -60,8 +60,8 @@ population <- population %>%
 population <- population %>% 
   mutate(iso = ifelse(iso == "43745", "80000", iso))
 
-population <- population %>% 
-  mutate(iso = ifelse(   as.numeric(str_sub(iso, 1, 2))>=40, paste0(str_sub(iso, 1, 4), "0"), iso))
+# population <- population %>% 
+  # mutate(iso = ifelse(   as.numeric(str_sub(iso, 1, 2))>=40, paste0(str_sub(iso, 1, 4), "0"), iso))
 
 population <- population %>% left_join(region_kosis, by=c("iso"="city_kosis"))
 
