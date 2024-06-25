@@ -102,7 +102,7 @@ population <- population %>%
 population_growth_sigungu <- population %>% 
   group_by(iso) %>% 
   mutate(pop_lag = lag(pop)) %>% 
-  mutate(pop_gr = pop - pop_lag) %>% 
+  mutate(pop_gr = log(pop) - log(pop_lag)) %>% 
   select(year, iso, cz_id, cz_label, pop_gr) %>% 
   ungroup()
 
@@ -120,7 +120,7 @@ population_growth_cz <- population %>%
 population_growth_cz <- population_growth_cz %>%  
   group_by(cz_id) %>% 
   mutate(pop_lag = lag(pop)) %>% 
-  mutate(pop_gr = pop - pop_lag) %>% 
+  mutate(pop_gr = log(pop) - log(pop_lag)) %>% 
   select(year, cz_id, pop_gr) %>% 
   ungroup()
 
