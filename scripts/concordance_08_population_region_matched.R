@@ -98,6 +98,9 @@ cz <- read_rds(here("proc", "commuting_zone.rds")) %>%
 population <- population %>% 
   left_join(cz, by="iso")
 
+population %>% 
+  write_rds(here("data", "temp", "pop_2001_2010_2020.rds"))
+
 # sigungu version
 population_growth_sigungu <- population %>% 
   group_by(iso) %>% 
@@ -126,6 +129,4 @@ population_growth_cz <- population_growth_cz %>%
 
 population_growth_cz %>% 
   write_rds(here("data", "temp", "pop_growth_cz.rds"))
-
-
 
